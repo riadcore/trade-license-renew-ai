@@ -655,9 +655,8 @@ def build_ui():
             restart_btn = gr.Button("Restart", variant="secondary")
 
         total_out = gr.Number(label="Grand Total (৳)", precision=2, interactive=False)
-        with gr.Accordion("Show Detailed Breakdown (raw)", open=False):
-            breakdown_json = gr.Textbox(label="Detailed Breakdown (raw)", lines=10, interactive=False)
-
+        with gr.Accordion("Show Detailed Breakdown (raw)", open=False):  # 👈 collapsible
+            breakdown_json = gr.JSON(label="Detailed Breakdown (raw)")
         breakdown_html = gr.HTML(label="সারাংশ / Status")
 
         # Hidden states
@@ -814,7 +813,4 @@ if __name__ == "__main__":
     demo = build_ui()
     demo.queue()
     port = int(os.getenv("PORT", os.getenv("GRADIO_SERVER_PORT", "7860")))
-    demo.launch(server_name="0.0.0.0", server_port=port, share=True, show_error=True)
-
-
-
+    demo.launch(server_name="0.0.0.0", server_port=port, ssr_mode=False, show_error=True)
