@@ -12,7 +12,8 @@ from typing import Dict, Any, Optional, Tuple
 import gradio as gr
 import fitz  # PyMuPDF
 from PIL import Image
-os.environ["TESSDATA_PREFIX"] = os.path.abspath("tessdata")
+import numpy as np
+
 
 # -------- keep storage tiny on Spaces / containers --------
 for p in ["~/.cache/huggingface", "~/.cache/pip", "~/.cache/torch", "~/.cache"]:
@@ -30,6 +31,19 @@ try:
     OCR_AVAILABLE = True
 except Exception:
     OCR_AVAILABLE = False
+
+
+# -------- Optional EasyOCR fallback --------
+try:
+    import easyocr
+    EASY_OCR_AVAILABLE = True
+    EASY_OCR_READER = None  # lazy init
+except Exception:
+    EASY_OCR_AVAILABLE = False
+    EASY_OCR_READER = None
+
+
+
 
 FAST_OCR_CONFIG = r"--oem 1 --psm 6 -l ben+eng"
 FALLBACK_OCR_CONFIGS = [
@@ -64,6 +78,24 @@ def ocr_image_fast(im: Image.Image, config: str = FAST_OCR_CONFIG) -> str:
                 txt = t2
     return txt
 
+
+def ocr_image_easy(im: Image.Image) -> str:
+    """
+    EasyOCR fallback — works better for noisy/scanned Bangla images.
+    """
+    global EASY_OCR_READER
+    if not EASY_OCR_AVAILABLE:
+        return ""
+    try:
+        if EASY_OCR_READER is None:
+            EASY_OCR_READER = easyocr.Reader(['bn', 'en'], gpu=False)
+        im_rgb = im.convert("RGB")
+        res = EASY_OCR_READER.readtext(np.array(im_rgb), detail=0, paragraph=True)
+        return "\n".join(res)
+    except Exception:
+        return ""
+
+
 def extract_text_from_path(path: str, ocr_all_pages: bool = False) -> Tuple[str, str]:
     """Return (text, method). Prefer selectable text, else OCR."""
     p = pathlib.Path(path)
@@ -91,10 +123,16 @@ def extract_text_from_path(path: str, ocr_all_pages: bool = False) -> Tuple[str,
         except Exception:
             pass
 
-    # Image branch
+    # Image branch (Try Tesseract first, then EasyOCR)
     try:
         im = Image.open(path)
-        return ocr_image_fast(im), "ocr_image"
+        text = ocr_image_fast(im)
+        if len(text.strip()) < 30:  # weak result → try EasyOCR
+            text_e = ocr_image_easy(im)
+            if len(text_e.strip()) > len(text.strip()):
+                text = text_e
+                return text, "easyocr_image"
+        return text, "ocr_image"
     except Exception:
         return "", "none"
 
