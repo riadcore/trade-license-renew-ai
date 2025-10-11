@@ -12,8 +12,18 @@ from typing import Dict, Any, Optional, Tuple
 import gradio as gr
 import fitz  # PyMuPDF
 from PIL import Image
-import numpy as np
+import unicodedata
 
+def bn_norm(s: str) -> str:
+    if not s:
+        return s
+    s = unicodedata.normalize("NFC", s)
+    # unify separator variants to colon
+    s = s.replace("：", ":").replace("ঃ", ":").replace("।", ":")
+    # strip zero-width ghosts and collapse spaces
+    s = re.sub(r"[\u200b\u200c\u200d\u2060]", "", s)
+    s = re.sub(r"[ \t]+", " ", s)
+    return s.strip()
 
 # -------- keep storage tiny on Spaces / containers --------
 for p in ["~/.cache/huggingface", "~/.cache/pip", "~/.cache/torch", "~/.cache"]:
@@ -31,19 +41,6 @@ try:
     OCR_AVAILABLE = True
 except Exception:
     OCR_AVAILABLE = False
-
-
-# -------- Optional EasyOCR fallback --------
-try:
-    import easyocr
-    EASY_OCR_AVAILABLE = True
-    EASY_OCR_READER = None  # lazy init
-except Exception:
-    EASY_OCR_AVAILABLE = False
-    EASY_OCR_READER = None
-
-
-
 
 FAST_OCR_CONFIG = r"--oem 1 --psm 6 -l ben+eng"
 FALLBACK_OCR_CONFIGS = [
@@ -78,24 +75,6 @@ def ocr_image_fast(im: Image.Image, config: str = FAST_OCR_CONFIG) -> str:
                 txt = t2
     return txt
 
-
-def ocr_image_easy(im: Image.Image) -> str:
-    """
-    EasyOCR fallback — works better for noisy/scanned Bangla images.
-    """
-    global EASY_OCR_READER
-    if not EASY_OCR_AVAILABLE:
-        return ""
-    try:
-        if EASY_OCR_READER is None:
-            EASY_OCR_READER = easyocr.Reader(['bn', 'en'], gpu=False)
-        im_rgb = im.convert("RGB")
-        res = EASY_OCR_READER.readtext(np.array(im_rgb), detail=0, paragraph=True)
-        return "\n".join(res)
-    except Exception:
-        return ""
-
-
 def extract_text_from_path(path: str, ocr_all_pages: bool = False) -> Tuple[str, str]:
     """Return (text, method). Prefer selectable text, else OCR."""
     p = pathlib.Path(path)
@@ -123,16 +102,10 @@ def extract_text_from_path(path: str, ocr_all_pages: bool = False) -> Tuple[str,
         except Exception:
             pass
 
-    # Image branch (Try Tesseract first, then EasyOCR)
+    # Image branch
     try:
         im = Image.open(path)
-        text = ocr_image_fast(im)
-        if len(text.strip()) < 30:  # weak result → try EasyOCR
-            text_e = ocr_image_easy(im)
-            if len(text_e.strip()) > len(text.strip()):
-                text = text_e
-                return text, "easyocr_image"
-        return text, "ocr_image"
+        return ocr_image_fast(im), "ocr_image"
     except Exception:
         return "", "none"
 
@@ -140,6 +113,56 @@ def extract_text_from_path(path: str, ocr_all_pages: bool = False) -> Tuple[str,
 # =========================
 # PARSERS
 # =========================
+
+# ---------- Generic, brand-agnostic cleanups for Business Name ----------
+BN_CONSONANTS = "কখগঘঙচছজঝঞটঠডঢণতথদধনপফবভমযরলশষসহ"
+BN_VOWEL_SIGNS = "\u09BE\u09BF\u09C0\u09C1\u09C2\u09C7\u09C8\u09CB\u09CC"  # া ি ী ু ূ ে ৈ ো ৌ
+
+def _normalize_biz_name_generic(s: str) -> str:
+    """
+    Conservative Bengali cleanup for Business Name:
+    - remove zero-width chars
+    - trim bullets/colons/punctuation from start
+    - collapse internal spaces
+    - fix 'halant + spaces' artifacts
+    - keep legal suffixes; normalize spacing around them
+    """
+    if not s:
+        return s
+
+    # base normalize + your bn_norm (already imported above)
+    s = bn_norm(s)
+
+    # remove zero-width ghosts (if any survived)
+    s = re.sub(r"[\u200b\u200c\u200d\u2060]", "", s)
+
+    # drop leading numbering/bullets/separators (common in left table)
+    s = re.sub(r"^\s*[০-৯0-9]+[).:-]*\s*", "", s)
+    s = re.sub(r"^[\s:：ঃ।=\/\-–—]+", "", s)
+
+    # collapse extra spaces
+    s = re.sub(r"\s{2,}", " ", s).strip()
+
+    # fix halant + spaces between consonants → join (ক্ ম → ক্ম)
+    s = re.sub(
+    rf"([{BN_CONSONANTS}])\u09CD\s+([{BN_CONSONANTS}])",
+    lambda m: m.group(1) + "\u09CD" + m.group(2),
+    s
+)
+
+
+    # conservative de-halant only when a vowel sign follows (keeps letters)
+    s = re.sub(
+        rf"([{BN_CONSONANTS}])\u09CD([মনরলয])([{BN_VOWEL_SIGNS}])",
+        r"\1\2\3",
+        s
+    )
+
+    # keep legal suffixes, just normalize spacing before them
+    s = re.sub(r"\s*(লিঃ|লিমিটেড|Limited|Ltd\.?)\s*$", r" \1", s, flags=re.IGNORECASE)
+
+    return s.strip()
+
 
 # ---- Business name (Bangla exact labels) ----
 BUSINESS_NAME_LABELS = [
@@ -167,10 +190,14 @@ def extract_business_name(text: str) -> str:
                     cand = tail[1].strip()
 
                 def _clean(s: str) -> str:
-                    s = s.strip()
+                    s = bn_norm(s)
+                    # strip leading separators and bullets
                     s = re.sub(r"^[\s:।–—\-]+", "", s)
                     s = re.sub(r"^[০-৯0-9]+[).:-]*\s*", "", s)
+                    # brand-agnostic Bengali cleanup (does NOT remove 'লিঃ' / 'লিমিটেড' / 'Ltd.')
+                    s = _normalize_biz_name_generic(s)
                     return s.strip()
+
 
                 if cand and not re.fullmatch(r"[:।–—\-]*", cand):
                     name = _clean(cand)
@@ -238,8 +265,39 @@ def detect_corporation(text: str) -> str:
 
 
 def extract_license_number(text: str) -> Optional[str]:
-    m = re.search(r"(TRAD\/(?:DSCC|DNCC)\/\d{3,}\/\d{4})", text, flags=re.IGNORECASE)
-    return m.group(1) if m else None
+    """
+    Robustly parse TRAD/<DSCC|DNCC>/<number>/<year> even if OCR:
+    - drops slashes or turns them into I|l|1
+    - inserts spaces
+    - reads 'DSCCI' or 'DNCCI' etc.
+    """
+    if not text:
+        return None
+
+    t = bn_norm(text)
+    t = normalize_digits(t)
+
+    # Accept /, |, \, I, l, 1 (common OCR confusions) as separators, optional
+    SEP = r"[\/|\\Il1\-\s]*"
+
+    # TRAD + corp (DSCC/DNCC with optional trailing I) + id + year
+    # Example matches:
+    #   TRADDSCC0079072025
+    #   TRAD/DSCC/007907/2025
+    #   TRAD I DSCCI I 007907 I 2025
+    pat = rf"T\s*R\s*A\s*D{SEP}(D\s*[SN]\s*C\s*C[Ii]?){SEP}(\d{{3,}}){SEP}(20\d{{2}})"
+
+    m = re.search(pat, t, flags=re.IGNORECASE)
+    if not m:
+        return None
+
+    corp_raw = re.sub(r"\s+", "", m.group(1)).upper()      # e.g. "DSCCI"
+    corp = "DSCC" if corp_raw.startswith("DSCC") else "DNCC"
+    num  = m.group(2)
+    year = m.group(3)
+
+    return f"TRAD/{corp}/{num}/{year}"
+
 
 def extract_last_renew_year(text: str) -> Optional[str]:
     m = re.search(r"(20\d{2})\s*[-–]\s*(20\d{2})", text)
@@ -275,6 +333,29 @@ def infer_last_renew_from_valid_until(valid_until: Optional[str]) -> Optional[st
         return None
     end = int(m.group(1))
     return f"{end-1}-{end}"
+
+
+def extract_per_year_fees(text: str) -> Tuple[Optional[float], Optional[float]]:
+    # Renew fee: allow optional 'লাইসেন্স', slash/dash, both য়/য় forms, and ন/ণ
+    renew_labels = [
+        r"(?:লাইসেন্স\s*[/\-]?\s*)?নব[াা]\s*[য়য়য]?\s*[নণ]\s*ফি",  # লাইসেন্স নবায়ন/নবায়ন ফি
+        r"নবায়ন\s*ফি",
+        r"নবায়ন\s*ফি",
+        r"(?:renew\s*fee|govt\s*renew\s*fee)",  # English fallback, if ever
+    ]
+
+    sign_labels = [
+        r"সাইনবোর্ড\s*কর\s*\(পরিচিতিমূলক\)",
+        r"সাইনবোর্ড\s*কর",
+        r"সাইনবোর্ড\s*চার্জ",
+        r"সাইন\s*বোর্ড\s*কর",
+        r"Signboard\s*(?:Charge|Tax)(?:\s*\(per\s*year\))?",
+        r"Sign\s*Board\s*(?:Charge|Tax)",
+    ]
+
+    return extract_amount_by_labels(text, renew_labels), extract_amount_by_labels(text, sign_labels)
+
+
 
 # Bangla → Latin digits
 BN_DIGITS = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
@@ -316,7 +397,7 @@ def extract_amount_by_labels(text: str, label_patterns) -> Optional[float]:
     Capture number near label (same/next line). Handles Bangla digits, currency signs,
     and separators like :, -, =, '/=' between label and number. Picks the FIRST plausible match.
     """
-    t = normalize_digits(text or "")
+    t = normalize_digits(bn_norm(text or ""))
 
     # allow 3,000 / 3 000 / 3000 (with optional decimals)
     # allow 3,000 / 3 000 / 3\u200B000 / 3000
@@ -337,7 +418,7 @@ def extract_amount_by_labels(text: str, label_patterns) -> Optional[float]:
             if re.search(lbl, ln, flags=re.IGNORECASE):
 
                 # ---- SAME LINE (keep window tight so we don't grab years/VAT later on the line)
-                m = re.search(lbl + sep + r".{0,32}?" + money, ln, flags=re.IGNORECASE)
+                m = re.search(lbl + sep + r"[^\d০-৯]{0,32}?" + money, ln, flags=re.IGNORECASE)
                 if m:
                     nums = re.findall(money_core, m.group(0))
                     for cand in nums:  # pick FIRST plausible
@@ -345,9 +426,9 @@ def extract_amount_by_labels(text: str, label_patterns) -> Optional[float]:
                         if _plausible(val):
                             return val
 
-                # ---- NEXT NON-EMPTY LINE
+                # ---- NEXT CONTENT LINE (skip empty AND punctuation-only lines like ":" "ঃ" "।")
                 j = i + 1
-                while j < len(lines) and lines[j].strip() == "":
+                while j < len(lines) and re.fullmatch(r"[\s:：ঃ।=\/\-–—]*", lines[j]):
                     j += 1
                 if j < len(lines):
                     m2 = re.search(money, lines[j], flags=re.IGNORECASE)
@@ -357,6 +438,7 @@ def extract_amount_by_labels(text: str, label_patterns) -> Optional[float]:
                             val2 = _to_float_safe(cand)
                             if _plausible(val2):
                                 return val2
+
 
     # ---- LAST RESORT: within 80 chars after label (across lines)
     for lbl in label_patterns:
@@ -373,27 +455,6 @@ def extract_amount_by_labels(text: str, label_patterns) -> Optional[float]:
 
 
 
-def extract_per_year_fees(text: str) -> Tuple[Optional[float], Optional[float]]:
-    renew_labels = [
-        r"লাইসেন্স\s*/\s*নবায়ন\s*ফি",
-        r"লাইসেন্স\s*ফি",
-        r"নবায়ন\s*ফি",
-        r"লাইসেন্স\s*নবায়ন\s*ফি",
-        r"বার্ষিক\s*লাইসেন্স\s*(?:নবায়ন\s*)?ফি",
-        r"বাৎসরিক\s*লাইসেন্স\s*(?:নবায়ন\s*)?ফি",
-        r"Renew(?:al)?\s*Fee(?:s)?(?:\s*\(per\s*year\))?",
-        r"License\s*Fee(?:s)?(?:\s*\(per\s*year\))?",
-        r"Renew\s*Fee",
-    ]
-    sign_labels = [
-        r"সাইনবোর্ড\s*কর\s*\(পরিচিতিমূলক\)",   # added priority label
-        r"সাইনবোর্ড\s*কর",
-        r"সাইনবোর্ড\s*চার্জ",
-        r"সাইন\s*বোর্ড\s*কর",
-        r"Signboard\s*(?:Charge|Tax)(?:\s*\(per\s*year\))?",
-        r"Sign\s*Board\s*(?:Charge|Tax)",
-    ]
-    return extract_amount_by_labels(text, renew_labels), extract_amount_by_labels(text, sign_labels)
 
 
 # =========================
@@ -497,7 +558,7 @@ def fmt_taka(x: float) -> str:
 
 BN_LABELS = {
     "Due (years)": "বকেয়া বছর",
-    "Fine for Month (auto)": "মাসের জরিমানা (স্বয়ংক্রিয়)",
+    "Fine for Month (auto)": "মোট জরিমানার মাসের সংখ্যা",
     "Govt Renew Fee": "সরকারি নবায়ন ফি",
     "Signboard Charge": "সাইনবোর্ড চার্জ",
     "Source TAX": "সূত্র কর",
@@ -515,19 +576,41 @@ BN_LABELS = {
 def breakdown_to_html_bn(corp: str, lic: str, biz: str,
                          last_renew: str, due: int, bd: dict,
                          renew_py: Optional[float], sign_py: Optional[float]) -> str:
+    """
+    Builds Bangla HTML breakdown table.
+    Changes:
+      - Header label: টাকা → ফলাফল
+      - Rows 'বকেয়া বছর' & 'মোট জরিমানার মাসের সংখ্যা' show plain numbers (no ৳)
+    """
+    # Keys that should display without currency symbol
+    PLAIN_KEYS = {"Due (years)", "Fine for Month (auto)"}
+
+    def _fmt_cell(k: str, v: float) -> str:
+        # omit "৳" only for the two keys above
+        if k in PLAIN_KEYS:
+            try:
+                return str(int(float(v)))  # just numeric
+            except Exception:
+                return str(v)
+        else:
+            return fmt_taka(v)  # keep ৳ for all others
+
     rows = []
     for k, v in bd.items():
         if k == "Grand Total":
             continue
+        label = BN_LABELS.get(k, k)
         rows.append(
-            f"<tr><td>{BN_LABELS.get(k, k)}</td>"
-            f"<td style='text-align:right'>{fmt_taka(v)}</td></tr>"
+            f"<tr><td>{label}</td>"
+            f"<td style='text-align:right'>{_fmt_cell(k, v)}</td></tr>"
         )
+
     grand = (
         f"<tr style='font-weight:700;border-top:2px solid #444'>"
         f"<td>{BN_LABELS.get('Grand Total','Grand Total')}</td>"
         f"<td style='text-align:right'>{fmt_taka(bd.get('Grand Total',0))}</td></tr>"
     )
+
     extra = ""
     if renew_py is not None or sign_py is not None:
         extra = (
@@ -535,6 +618,7 @@ def breakdown_to_html_bn(corp: str, lic: str, biz: str,
             f"Per-year (detected): Renew = {fmt_taka(renew_py or 0)}, "
             f"Signboard = {fmt_taka(sign_py or 0)}</div>"
         )
+
     hdr = f"""
     <div style="font-family:Inter,system-ui,Segoe UI,Arial; line-height:1.35; max-width:760px;">
       <h3 style="margin:.2rem 0;">ট্রেড লাইসেন্স নবায়ন — {corp}</h3>
@@ -549,7 +633,7 @@ def breakdown_to_html_bn(corp: str, lic: str, biz: str,
         <thead>
           <tr style="text-align:left; background:#111; color:#ddd;">
             <th style="padding:8px;">আইটেম</th>
-            <th style="padding:8px; text-align:right;">টাকা</th>
+            <th style="padding:8px; text-align:right;">ফলাফল</th>  <!-- header changed -->
           </tr>
         </thead>
         <tbody>
@@ -560,6 +644,7 @@ def breakdown_to_html_bn(corp: str, lic: str, biz: str,
     </div>
     """
     return hdr
+
 
 def parse_valid_until_date(valid_until_label: Optional[str]) -> Optional[date]:
     if not valid_until_label:
@@ -580,6 +665,7 @@ def parse_valid_until_date(valid_until_label: Optional[str]) -> Optional[date]:
 def analyze_upload(file_path: str, fast: bool) -> Dict[str, Any]:
     # 1) Try selectable text first (fast path if doc has good text)
     text, method = extract_text_from_path(file_path, ocr_all_pages=not fast)
+    print("\n\n===== EXTRACTED TEXT (DEBUG) =====\n", text[:3000], "\n\n")
     corp = detect_corporation(text)
     lic  = extract_license_number(text)
     valid_until = extract_valid_until(text)
@@ -602,16 +688,10 @@ def analyze_upload(file_path: str, fast: bool) -> Dict[str, Any]:
             sign_py  = s2 if s2 is not None else sign_py
             method = "ocr_pdf"
 
-    # 4) Defaults by corporation if still missing
-    if corp == "DNCC":
-        renew_py = renew_py or 2000.0
-        sign_py  = sign_py or 480.0
-    elif corp == "DSCC":
-        renew_py = renew_py or 500.0
-        sign_py  = sign_py or 640.0
-    else:
-        renew_py = renew_py or 1000.0
-        sign_py  = sign_py or 500.0
+    # 4) Remove default fallback — only keep OCR-detected values
+    # If renew_py or sign_py is not found, they will stay as None (or blank)
+    # This ensures the app only depends on real OCR extraction
+    # and does not auto-fill anything.
 
     # 5) Due/fine summary (same as before)
     due = compute_due(last_renew) if last_renew else 1
@@ -624,12 +704,13 @@ def analyze_upload(file_path: str, fast: bool) -> Dict[str, Any]:
         "last_renew_year": last_renew or "",
         "due_years": due,
         "fine_months": fine_m,
-        "renew_fee_py": float(renew_py),
-        "signboard_py": float(sign_py),
+        "renew_fee_py": float(renew_py) if renew_py is not None else None,
+        "signboard_py": float(sign_py) if sign_py is not None else None,
         "raw_text": text[:3000],
         "method": method,
-        "business_name": biz_name or "",   # 👈 NEW
+        "business_name": biz_name or "",
     }
+
 
 
 
@@ -716,13 +797,13 @@ def build_ui():
                 info.get("business_name", ""),   # 👈 now auto-fills Business Name
                 info["valid_until"], info["last_renew_year"], info["due_years"],
                 info["fine_months"], info["method"],
-                float(info["renew_fee_py"]), float(info["signboard_py"]),
+                float(info["renew_fee_py"] or 0.0), float(info["signboard_py"] or 0.0),
                 info.get("raw_text", ""),
                 dncc_vis and gr.update(visible=True) or gr.update(visible=False),
                 dscc_vis and gr.update(visible=True) or gr.update(visible=False),
                 # states
                 corp, info["last_renew_year"], info["license_no"], info["valid_until"],
-                float(info["renew_fee_py"]), float(info["signboard_py"]),
+                float(info["renew_fee_py"] or 0.0), float(info["signboard_py"] or 0.0),
                 # clear outputs
                 gr.update(value=""), gr.update(value=0.0),
             )
