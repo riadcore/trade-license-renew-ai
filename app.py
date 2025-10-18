@@ -825,11 +825,13 @@ def build_ui():
             today = date.today()
             if vdt is not None and vdt >= today:
                 msg_html = (
-                    "<div style='font-family:Inter,system-ui; padding:.5rem; "
-                    "border:1px solid #444; background:#111; color:#eee; border-radius:8px;'>"
-                    "<b>Already Trade License Renewed</b><br>"
-                    "Valid Until: " + (valid_lbl or "-") + "</div>"
+                    "<div style='font-family:Inter,system-ui; padding:.6rem; "
+                    "border:1px solid #444; background:#111; color:#fff; border-radius:8px;'>"
+                    "<b style='color:#00ff88;'>✅ Already Trade License Renewed</b><br>"
+                    f"<span style='color:#ccc;'>Valid Until: {valid_lbl or '-'}</span>"
+                    "</div>"
                 )
+
                 return (
                     0.0,
                     {"status": "Already Trade License Renewed", "valid_until": valid_lbl},
