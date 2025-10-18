@@ -8,12 +8,10 @@
 import io, os, re, shutil, pathlib
 from datetime import date, datetime
 from typing import Dict, Any, Optional, Tuple
-
 import gradio as gr
 import fitz  # PyMuPDF
 from PIL import Image
 import unicodedata
-
 def bn_norm(s: str) -> str:
     if not s:
         return s
@@ -24,14 +22,11 @@ def bn_norm(s: str) -> str:
     s = re.sub(r"[\u200b\u200c\u200d\u2060]", "", s)
     s = re.sub(r"[ \t]+", " ", s)
     return s.strip()
-
 # -------- keep storage tiny on Spaces / containers --------
 for p in ["~/.cache/huggingface", "~/.cache/pip", "~/.cache/torch", "~/.cache"]:
     pp = pathlib.Path(os.path.expanduser(p))
     if pp.exists():
         shutil.rmtree(pp, ignore_errors=True)
-# ---------------------------------------------------------
-
 # -------- OCR (for scanned PDFs / images) --------
 try:
     import pytesseract
@@ -41,26 +36,44 @@ try:
     OCR_AVAILABLE = True
 except Exception:
     OCR_AVAILABLE = False
-
 FAST_OCR_CONFIG = r"--oem 1 --psm 6 -l ben+eng"
 FALLBACK_OCR_CONFIGS = [
     r"--oem 1 --psm 11 -l ben+eng",  # sparse text
     r"--oem 1 --psm 4 -l ben+eng",   # block/column layout
 ]
+def _save_debug_image(im: Image.Image, prefix="debug_preprocessed"):
+    """Save OCR-ready grayscale/thresholded image with timestamp for visual debugging."""
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    # ✅ Change this path to your desired folder
+    debug_dir = r"C:\Users\user\trade-license-renew-ai\debug_images"
+
+    # Create folder if not exists
+    os.makedirs(debug_dir, exist_ok=True)
+
+    out_path = os.path.join(debug_dir, f"{prefix}_{ts}.jpg")
+    try:
+        im.save(out_path, "JPEG")
+        print(f"[DEBUG] Saved OCR view → {out_path}")
+    except Exception as e:
+        print(f"[WARN] Could not save debug image: {e}")
+
+from PIL import Image, ImageFilter  # keep this
 
 def _prep_image_for_ocr(im: Image.Image) -> Image.Image:
-    # 1) grayscale + moderate upscale
-    scale = 1.5
-    im = im.convert("L")
-    im = im.resize((int(im.width * scale), int(im.height * scale)))
-    # 2) light threshold normalization (keeps edges & digits)
-    im = im.point(lambda x: 255 if x > 200 else (0 if x < 140 else x))
-    # 3) clamp width (avoid huge memory)
+    scale = 1.6
+    im = im.convert("L").resize((int(im.width * scale), int(im.height * scale)))
+    # light smoothing before thresholding
+    im = im.filter(ImageFilter.GaussianBlur(0.8))
+    # slightly wider threshold window to keep strokes connected
+    im = im.point(lambda x: 255 if x > 210 else (0 if x < 130 else x))
     max_w = 2200
     if im.width > max_w:
         h = int(im.height * (max_w / im.width))
         im = im.resize((max_w, h))
+    _save_debug_image(im)
     return im
+
 
 def ocr_image_fast(im: Image.Image, config: str = FAST_OCR_CONFIG) -> str:
     if not OCR_AVAILABLE:
@@ -79,7 +92,6 @@ def extract_text_from_path(path: str, ocr_all_pages: bool = False) -> Tuple[str,
     """Return (text, method). Prefer selectable text, else OCR."""
     p = pathlib.Path(path)
     suffix = p.suffix.lower()
-
     if suffix == ".pdf":
         try:
             with fitz.open(path) as doc:
@@ -109,7 +121,6 @@ def extract_text_from_path(path: str, ocr_all_pages: bool = False) -> Tuple[str,
     except Exception:
         return "", "none"
 
-
 # =========================
 # PARSERS
 # =========================
@@ -119,14 +130,7 @@ BN_CONSONANTS = "কখগঘঙচছজঝঞটঠডঢণতথদধনপ
 BN_VOWEL_SIGNS = "\u09BE\u09BF\u09C0\u09C1\u09C2\u09C7\u09C8\u09CB\u09CC"  # া ি ী ু ূ ে ৈ ো ৌ
 
 def _normalize_biz_name_generic(s: str) -> str:
-    """
-    Conservative Bengali cleanup for Business Name:
-    - remove zero-width chars
-    - trim bullets/colons/punctuation from start
-    - collapse internal spaces
-    - fix 'halant + spaces' artifacts
-    - keep legal suffixes; normalize spacing around them
-    """
+
     if not s:
         return s
 
@@ -149,21 +153,16 @@ def _normalize_biz_name_generic(s: str) -> str:
     lambda m: m.group(1) + "\u09CD" + m.group(2),
     s
 )
-
-
     # conservative de-halant only when a vowel sign follows (keeps letters)
-    s = re.sub(
-        rf"([{BN_CONSONANTS}])\u09CD([মনরলয])([{BN_VOWEL_SIGNS}])",
-        r"\1\2\3",
-        s
-    )
-
+    # s = re.sub(
+    #     rf"([{BN_CONSONANTS}])\u09CD([মনরলয])([{BN_VOWEL_SIGNS}])",
+    #     r"\1\2\3",
+    #     s
+    # )
     # keep legal suffixes, just normalize spacing before them
-    s = re.sub(r"\s*(লিঃ|লিমিটেড|Limited|Ltd\.?)\s*$", r" \1", s, flags=re.IGNORECASE)
+    # s = re.sub(r"\s*(লিঃ|লিমিটেড|Limited|Ltd\.?)\s*$", r" \1", s, flags=re.IGNORECASE)
 
     return s.strip()
-
-
 # ---- Business name (Bangla exact labels) ----
 BUSINESS_NAME_LABELS = [
     r"১[।.]?\s*ব্যবসা\s*প্রতিষ্ঠানের\s*নাম",
@@ -178,6 +177,7 @@ def extract_business_name(text: str) -> str:
     """
     if not text:
         return ""
+    name = "" 
     lines = text.splitlines()
 
     for i, ln in enumerate(lines):
@@ -197,21 +197,27 @@ def extract_business_name(text: str) -> str:
                     # brand-agnostic Bengali cleanup (does NOT remove 'লিঃ' / 'লিমিটেড' / 'Ltd.')
                     s = _normalize_biz_name_generic(s)
                     return s.strip()
-
-
                 if cand and not re.fullmatch(r"[:।–—\-]*", cand):
                     name = _clean(cand)
                     if name:
                         return name
 
                 # Otherwise look in next few lines
-                for j in range(i + 1, min(i + 4, len(lines))):
+                for j in range(i + 1, min(i + 6, len(lines))):
                     s = lines[j].strip()
                     if not s or re.fullmatch(r"[:।–—\-]*", s):
                         continue
                     name = _clean(s)
                     if name:
                         return name
+
+    # If still not found, try fallback search across entire text
+    if not name:
+        m = re.search(r"ব্যবসা\s*প্রতিষ্ঠানের\s*নাম[:：ঃ।=–—-]*\s*([\u0980-\u09FF A-Za-z]+)", text)
+        if m:
+            return _normalize_biz_name_generic(m.group(1).strip())
+
+
     return ""
 
 
@@ -234,8 +240,6 @@ DSCC_PATTERNS = [
     r"\bdscc\b", r"dscc\.gov\.bd", r"www\.dscc\.gov\.bd",
     r"\bDhaka\s*South\s*City\s*Corporation\b",
 ]
-
-
 def detect_corporation(text: str) -> str:
     t = _clean_bn(text).lower()
     score = {"DNCC": 0, "DSCC": 0}
@@ -263,7 +267,6 @@ def detect_corporation(text: str) -> str:
         return "DSCC"
     return "UNKNOWN"
 
-
 def extract_license_number(text: str) -> Optional[str]:
     """
     Robustly parse TRAD/<DSCC|DNCC>/<number>/<year> even if OCR:
@@ -286,7 +289,6 @@ def extract_license_number(text: str) -> Optional[str]:
     #   TRAD/DSCC/007907/2025
     #   TRAD I DSCCI I 007907 I 2025
     pat = rf"T\s*R\s*A\s*D{SEP}(D\s*[SN]\s*C\s*C[Ii]?){SEP}(\d{{3,}}){SEP}(20\d{{2}})"
-
     m = re.search(pat, t, flags=re.IGNORECASE)
     if not m:
         return None
@@ -297,7 +299,6 @@ def extract_license_number(text: str) -> Optional[str]:
     year = m.group(3)
 
     return f"TRAD/{corp}/{num}/{year}"
-
 
 def extract_last_renew_year(text: str) -> Optional[str]:
     m = re.search(r"(20\d{2})\s*[-–]\s*(20\d{2})", text)
@@ -324,7 +325,6 @@ def extract_valid_until(text: str) -> Optional[str]:
         return f"30 June {max(map(int, years))}"
     return None
 
-
 def infer_last_renew_from_valid_until(valid_until: Optional[str]) -> Optional[str]:
     if not valid_until:
         return None
@@ -334,7 +334,6 @@ def infer_last_renew_from_valid_until(valid_until: Optional[str]) -> Optional[st
     end = int(m.group(1))
     return f"{end-1}-{end}"
 
-
 def extract_per_year_fees(text: str) -> Tuple[Optional[float], Optional[float]]:
     # Renew fee: allow optional 'লাইসেন্স', slash/dash, both য়/য় forms, and ন/ণ
     renew_labels = [
@@ -343,19 +342,18 @@ def extract_per_year_fees(text: str) -> Tuple[Optional[float], Optional[float]]:
         r"নবায়ন\s*ফি",
         r"(?:renew\s*fee|govt\s*renew\s*fee)",  # English fallback, if ever
     ]
-
     sign_labels = [
         r"সাইনবোর্ড\s*কর\s*\(পরিচিতিমূলক\)",
         r"সাইনবোর্ড\s*কর",
         r"সাইনবোর্ড\s*চার্জ",
         r"সাইন\s*বোর্ড\s*কর",
+        r"সাইনবোর্ড\s*কর\s*\(বার্ষিক\)",
         r"Signboard\s*(?:Charge|Tax)(?:\s*\(per\s*year\))?",
         r"Sign\s*Board\s*(?:Charge|Tax)",
     ]
 
+
     return extract_amount_by_labels(text, renew_labels), extract_amount_by_labels(text, sign_labels)
-
-
 
 # Bangla → Latin digits
 BN_DIGITS = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
@@ -369,7 +367,6 @@ def _to_float_safe(num_str: Optional[str]) -> Optional[float]:
     """
     if not num_str:
         return None
-
     orig = normalize_digits(num_str)
 
     # 1) Remove common noise
@@ -390,71 +387,76 @@ def _to_float_safe(num_str: Optional[str]) -> Optional[float]:
 
     return None
 
-
-
 def extract_amount_by_labels(text: str, label_patterns) -> Optional[float]:
     """
-    Capture number near label (same/next line). Handles Bangla digits, currency signs,
+    Capture number near label (same/next few lines). Handles Bangla digits, currency signs,
     and separators like :, -, =, '/=' between label and number. Picks the FIRST plausible match.
+    More tolerant to OCR that splits label/number across lines.
     """
     t = normalize_digits(bn_norm(text or ""))
 
-    # allow 3,000 / 3 000 / 3000 (with optional decimals)
-    # allow 3,000 / 3 000 / 3\u200B000 / 3000
     money_core = r"(?:\d[\d,，\s\u200b\u200c\u200d\u2060]*\d(?:\.\d+)?|\d+)"
-
-
     money = rf"(?:৳|Tk\.?|Taka|টাকা)?\s*{money_core}"
     sep = r"(?:\s*[:=–—\-\/=]\s*)?"
 
     def _plausible(v: Optional[float]) -> bool:
-        # Typical per-year fees are in the hundreds to tens of thousands
         return v is not None and 200 <= v <= 50000
 
     lines = t.splitlines()
 
     for i, ln in enumerate(lines):
         for lbl in label_patterns:
-            if re.search(lbl, ln, flags=re.IGNORECASE):
+            if not re.search(lbl, ln, flags=re.IGNORECASE):
+                continue
 
-                # ---- SAME LINE (keep window tight so we don't grab years/VAT later on the line)
-                m = re.search(lbl + sep + r"[^\d০-৯]{0,32}?" + money, ln, flags=re.IGNORECASE)
-                if m:
-                    nums = re.findall(money_core, m.group(0))
-                    for cand in nums:  # pick FIRST plausible
-                        val = _to_float_safe(cand)
-                        if _plausible(val):
-                            return val
+            # ---- SAME LINE
+            m = re.search(lbl + sep + r"[^\d০-৯]{0,32}?" + money, ln, flags=re.IGNORECASE)
+            if m:
+                for cand in re.findall(money_core, m.group(0)):
+                    val = _to_float_safe(cand)
+                    if _plausible(val):
+                        return val
 
-                # ---- NEXT CONTENT LINE (skip empty AND punctuation-only lines like ":" "ঃ" "।")
-                j = i + 1
-                while j < len(lines) and re.fullmatch(r"[\s:：ঃ।=\/\-–—]*", lines[j]):
-                    j += 1
-                if j < len(lines):
-                    m2 = re.search(money, lines[j], flags=re.IGNORECASE)
-                    if m2:
-                        nums2 = re.findall(money_core, m2.group(0))
-                        for cand in nums2:
-                            val2 = _to_float_safe(cand)
-                            if _plausible(val2):
-                                return val2
+            # ---- SKIP punctuation-only lines after the label
+            j = i + 1
+            while j < len(lines) and re.fullmatch(r"[\s:：ঃ।=\/\-–—]*", lines[j]):
+                j += 1
 
+            # ---- NEXT CONTENT LINE
+            if j < len(lines):
+                m2 = re.search(money, lines[j], flags=re.IGNORECASE)
+                if m2:
+                    for cand in re.findall(money_core, m2.group(0)):
+                        val2 = _to_float_safe(cand)
+                        if _plausible(val2):
+                            return val2
 
-    # ---- LAST RESORT: within 80 chars after label (across lines)
+            # ---- ROLLING WINDOW: next up to 3 content lines merged
+            k = j
+            taken = []
+            while k < len(lines) and len(taken) < 3:
+                if not re.fullmatch(r"[\s:：ঃ।=\/\-–—]*", lines[k]):
+                    taken.append(lines[k].strip())
+                k += 1
+            if taken:
+                blob = " ".join(taken)
+                m3 = re.search(money, blob, flags=re.IGNORECASE)
+                if m3:
+                    for cand in re.findall(money_core, m3.group(0)):
+                        val3 = _to_float_safe(cand)
+                        if _plausible(val3):
+                            return val3
+
+    # ---- LAST RESORT: allow up to 200 chars (any, including newlines)
     for lbl in label_patterns:
-        m3 = re.search(lbl + r".{0,80}?" + money, t, flags=re.IGNORECASE | re.DOTALL)
-        if m3:
-            nums3 = re.findall(money_core, m3.group(0))
-            for cand in nums3:
-                val3 = _to_float_safe(cand)
-                if _plausible(val3):
-                    return val3
+        m4 = re.search(lbl + r"(?:[\s\S]{0,200})?" + money, t, flags=re.IGNORECASE)
+        if m4:
+            for cand in re.findall(money_core, m4.group(0)):
+                val4 = _to_float_safe(cand)
+                if _plausible(val4):
+                    return val4
 
     return None
-
-
-
-
 
 
 # =========================
@@ -488,7 +490,6 @@ def compute_fine_months(due_years: int, today: Optional[date] = None) -> int:
     msj = months_since_july(today)
     add = msj if msj > 2 else 0
     return max(0, (due_years * 12) - 12 + add)
-
 
 # =========================
 # CALCULATORS
@@ -545,7 +546,6 @@ def calc_dscc(last_renew_lbl, renew_fee_py, signboard_py, source_tax_py=3000.0,
         "Bank Charge": float(bank),
         "Grand Total": float(grand_total),
     }
-
 
 # =========================
 # UI HELPERS
@@ -631,11 +631,16 @@ def breakdown_to_html_bn(corp: str, lic: str, biz: str,
       {extra}
       <table style="width:100%; border-collapse:collapse; margin-top:.5rem;">
         <thead>
-          <tr style="text-align:left; background:#111; color:#ddd;">
-            <th style="padding:8px;">আইটেম</th>
-            <th style="padding:8px; text-align:right;">ফলাফল</th>  <!-- header changed -->
-          </tr>
+        <tr>
+            <th style="padding:8px; background:#111; color:#fff !important; font-weight:600; text-align:left;">
+            আইটেম
+            </th>
+            <th style="padding:8px; background:#111; color:#fff !important; font-weight:600; text-align:right;">
+            ফলাফল
+            </th>
+        </tr>
         </thead>
+
         <tbody>
           {''.join(rows)}
           {grand}
@@ -644,8 +649,6 @@ def breakdown_to_html_bn(corp: str, lic: str, biz: str,
     </div>
     """
     return hdr
-
-
 def parse_valid_until_date(valid_until_label: Optional[str]) -> Optional[date]:
     if not valid_until_label:
         return None
@@ -657,8 +660,6 @@ def parse_valid_until_date(valid_until_label: Optional[str]) -> Optional[date]:
         if m:
             return date(int(m.group(1)), 6, 30)
     return None
-
-
 # =========================
 # PIPELINE
 # =========================
@@ -671,7 +672,6 @@ def analyze_upload(file_path: str, fast: bool) -> Dict[str, Any]:
     valid_until = extract_valid_until(text)
     last_renew = extract_last_renew_year(text) or infer_last_renew_from_valid_until(valid_until)
     biz_name = extract_business_name(text)
-
 
     # 2) Auto-detect per-year fees from the current text
     renew_py, sign_py = extract_per_year_fees(text)
@@ -692,7 +692,6 @@ def analyze_upload(file_path: str, fast: bool) -> Dict[str, Any]:
     # If renew_py or sign_py is not found, they will stay as None (or blank)
     # This ensures the app only depends on real OCR extraction
     # and does not auto-fill anything.
-
     # 5) Due/fine summary (same as before)
     due = compute_due(last_renew) if last_renew else 1
     fine_m = compute_fine_months(due)
@@ -710,9 +709,6 @@ def analyze_upload(file_path: str, fast: bool) -> Dict[str, Any]:
         "method": method,
         "business_name": biz_name or "",
     }
-
-
-
 
 # =========================
 # UI
@@ -736,9 +732,6 @@ def build_ui():
             due_out = gr.Number(label="Due (years)", interactive=False, precision=0)
         fine_months_out = gr.Number(label="Fine for Month (auto)", interactive=False, precision=0)
         method_out = gr.Textbox(label="Extraction Method", interactive=False)
-
-
-
         gr.Markdown("### Detected (auto)")
         with gr.Row():
             renew_py_view = gr.Number(label="Renew Fee (per year)", interactive=True, precision=0)
@@ -746,7 +739,6 @@ def build_ui():
 
         with gr.Accordion("Show extracted text (debug)", open=False):
             raw_text_view = gr.Textbox(lines=8, interactive=False)
-
         gr.Markdown("### Enter/Adjust Other Fees")
         dncc_group = gr.Group(visible=False)
         with dncc_group:
@@ -808,7 +800,6 @@ def build_ui():
                 gr.update(value=""), gr.update(value=0.0),
             )
 
-
         analyze_btn.click(
             on_analyze,
             inputs=[file_in, fast_ocr],
@@ -824,7 +815,6 @@ def build_ui():
                 breakdown_html, total_out
             ],
         )
-
         # ---- Compute ----
         def on_compute(corp: str, last_lbl: str, lic: str, valid_lbl: str, biz_manual: str,
                        renew_py: float, sign_py: float,
@@ -926,8 +916,7 @@ def build_ui():
         )
 
     return demo
-
-
+    
 if __name__ == "__main__":
     demo = build_ui()
     demo.queue()
